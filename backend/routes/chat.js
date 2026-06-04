@@ -23,7 +23,7 @@ router.post('/', async (req, res) => {
     ];
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: 500,
       system: profile.system_prompt + '\n\nRicorda tutto ciò che è stato detto in questa conversazione e sii coerente.',
       messages
@@ -74,7 +74,7 @@ router.post('/learn', async (req, res) => {
     const currentProfile = profile.profile_json;
 
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: 1200,
       system: `Sei un esperto di linguistica. Dato un profilo esistente e nuovi scambi conversazionali, aggiorna il profilo con ciò che hai imparato. Restituisci SOLO JSON valido con la stessa struttura del profilo originale. Il gemellaggio può salire al massimo di 3 punti per aggiornamento. Non superare mai 88.`,
       messages: [{
