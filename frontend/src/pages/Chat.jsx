@@ -73,7 +73,7 @@ export default function Chat() {
     if (!input.trim() || loading) return;
     const text = input.trim();
     setInput('');
-    const history = messages.filter(m => !m.isFirst && !m.isLearned);
+   const history = messages.filter(m => !m.isFirst && !m.isLearned && m.content && m.content.trim().length > 0);
     setMessages(m => [...m, { role: 'user', content: text }]);
     setLoading(true);
     try {
