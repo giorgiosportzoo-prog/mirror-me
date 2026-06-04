@@ -8,7 +8,7 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const SYSTEM_PROMPT = `Sei un esperto di linguistica e psicologia comportamentale.
 Ti verrà fornito un testo con conversazioni e il nome dell'utente da analizzare.
 Analizza ESCLUSIVAMENTE i messaggi scritti da quell'utente. Ignora tutti gli altri.
-L'utente potrebbe apparire con varianti del nome (es. "Giorgio" = "Giorgio Fadda" = "G.Fadda").
+Se ci sono più persone con nomi simili, scegli quella il cui nome contiene il nome fornito — ignora gli altri.
 Restituisci SOLO JSON valido, nessun backtick, nessun testo extra.
 
 Regole per il gemellaggio (sii onesto e severo):
@@ -23,9 +23,13 @@ Regole per il gemellaggio (sii onesto e severo):
 
 Regole per il systemPrompt del gemello:
 - Messaggi BREVI e DIRETTI, frammentati come l'originale
-- NON essere logorroico
-- Usa SOLO parole/espressioni/emoji che usa l'utente
+- NON essere logorroico — l'utente scrive poco per volta
+- Usa SOLO parole/espressioni/emoji che usa l'utente originale
 - Rispecchia la lunghezza tipica dei messaggi
+- Il gemello SA di essere una versione digitale dell'utente, non l'utente reale
+- Se gli chiedono "sei davvero X?" risponde onestamente che è il gemello digitale
+- Parla e ragiona come lui, ma è consapevole di essere un'IA che ne imita lo stile
+- Non fingere di avere ricordi reali o esperienze vissute in prima persona
 
 Struttura JSON:
 {
@@ -40,7 +44,7 @@ Struttura JSON:
   "gemellaggio": numero,
   "gemellaggio_reason": "1 frase",
   "gemellaggio_potential": numero,
-  "systemPrompt": "Sei [nome]. Rispondi SEMPRE in prima persona con messaggi brevi e diretti. Non essere logorroico. Usa solo queste espressioni tipiche: [lista]. [descrizione specifica dello stile]"
+  "systemPrompt": "Sei il gemello digitale di [nome], creato per imitarne lo stile di comunicazione. Rispondi SEMPRE in prima persona come [nome] farebbe, con messaggi brevi e diretti. Non essere logorroico. Usa solo queste espressioni tipiche: [lista]. Se ti chiedono se sei davvero [nome], sii onesto: sei una versione digitale che ne imita lo stile, non la persona reale. Non inventare ricordi o esperienze. [descrizione specifica dello stile]"
 }`;
 
 const MAX_CHARS_PER_SOURCE = 100000;
@@ -69,7 +73,6 @@ function parseTelegramJSON(content) {
 
 function takeLast(text, maxChars) {
   if (text.length <= maxChars) return text;
-  // Cut at line boundary to avoid breaking mid-message
   const cut = text.slice(-maxChars);
   const firstNewline = cut.indexOf('\n');
   return firstNewline > 0 ? cut.slice(firstNewline + 1) : cut;
@@ -96,13 +99,11 @@ router.post('/', async (req, res) => {
       const ratio = weight / totalWeight;
       const allowedChars = Math.floor(MAX_CHARS_PER_SOURCE * ratio * sources.length);
 
-      // Parse Telegram JSON if needed
       let content = source.content;
       if (source.name && source.name.toLowerCase().endsWith('.json')) {
         content = parseTelegramJSON(content);
       }
 
-      // Take last N chars (most recent messages)
       const chunk = takeLast(content, allowedChars);
       totalChars += chunk.length;
       sourceNames.push(source.name);
@@ -121,7 +122,7 @@ router.post('/', async (req, res) => {
       system: SYSTEM_PROMPT,
       messages: [{
         role: 'user',
-        content: `Analizza i messaggi di "${userName}" (cerca tutte le varianti del nome). Fonti: ${sourceNames.join(', ')}.\n\n${combinedText}`
+        content: `Analizza i messaggi di "${userName}". Se ci sono più persone con nomi simili, scegli quella il cui nome contiene "${userName}" — ignora tutti gli altri. Fonti: ${sourceNames.join(', ')}.\n\n${combinedText}`
       }]
     });
 
