@@ -45,7 +45,7 @@ router.post('/', async (req, res) => {
     const truncated = text.slice(0, 12000);
 
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: 1500,
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: `Analizza questo testo (${wordCount} parole):\n\n${truncated}` }]
