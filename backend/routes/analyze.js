@@ -43,6 +43,8 @@ Struttura JSON:
   "systemPrompt": "Sei [nome]. Rispondi SEMPRE in prima persona con messaggi brevi e diretti. Non essere logorroico. Usa solo queste espressioni tipiche: [lista]. [descrizione specifica dello stile]"
 }`;
 
+const MAX_CHARS_PER_SOURCE = 100000;
+
 function parseTelegramJSON(content) {
   try {
     const data = JSON.parse(content);
@@ -53,12 +55,24 @@ function parseTelegramJSON(content) {
       const from = msg.from || msg.from_id || 'Unknown';
       let text = '';
       if (typeof msg.text === 'string') text = msg.text;
-      else if (Array.isArray(msg.text)) text = msg.text.map(t => typeof t === 'string' ? t : (t.text || '')).join('');
+      else if (Array.isArray(msg.text)) {
+        text = msg.text.map(t => typeof t === 'string' ? t : (t.text || '')).join('');
+      }
       if (!text.trim()) continue;
       lines.push(`${from}: ${text}`);
     }
     return lines.join('\n');
-  } catch { return content; }
+  } catch {
+    return content;
+  }
+}
+
+function takeLast(text, maxChars) {
+  if (text.length <= maxChars) return text;
+  // Cut at line boundary to avoid breaking mid-message
+  const cut = text.slice(-maxChars);
+  const firstNewline = cut.indexOf('\n');
+  return firstNewline > 0 ? cut.slice(firstNewline + 1) : cut;
 }
 
 router.post('/', async (req, res) => {
@@ -72,33 +86,34 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Inserisci il tuo nome come appare nelle chat.' });
     }
 
-    const MAX_TOTAL = 80000;
     const totalWeight = sources.reduce((sum, s) => sum + (s.weight || 1), 0);
-
     let combinedText = '';
-    let totalWords = 0;
+    let totalChars = 0;
     const sourceNames = [];
 
     sources.forEach(source => {
       const weight = source.weight || 1;
       const ratio = weight / totalWeight;
-      const allowedChars = Math.floor(MAX_TOTAL * ratio);
+      const allowedChars = Math.floor(MAX_CHARS_PER_SOURCE * ratio * sources.length);
 
       // Parse Telegram JSON if needed
       let content = source.content;
-      if (source.name && source.name.endsWith('.json')) {
+      if (source.name && source.name.toLowerCase().endsWith('.json')) {
         content = parseTelegramJSON(content);
       }
 
-      const chunk = content.slice(0, allowedChars);
-      totalWords += chunk.trim().split(/\s+/).length;
+      // Take last N chars (most recent messages)
+      const chunk = takeLast(content, allowedChars);
+      totalChars += chunk.length;
       sourceNames.push(source.name);
-      combinedText += `\n\n--- FONTE: ${source.name} ---\n${chunk}`;
+      combinedText += `\n\n--- FONTE: ${source.name} (ultimi messaggi, importanza ${Math.round(weight * 100)}%) ---\n${chunk}`;
     });
 
     if (combinedText.trim().length < 20) {
       return res.status(400).json({ error: 'Testo troppo corto.' });
     }
+
+    const totalWords = combinedText.trim().split(/\s+/).length;
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
