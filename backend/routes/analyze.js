@@ -5,46 +5,85 @@ const supabase = require('../supabase');
 const router = express.Router();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const SYSTEM_PROMPT = `Sei un esperto di linguistica e psicologia comportamentale. 
-Analizza il testo fornito e restituisci SOLO JSON valido, nessun backtick, nessun testo extra.
+const SYSTEM_PROMPT = `Sei un esperto di linguistica e psicologia comportamentale.
+Analizza SOLO i messaggi scritti dall'utente specificato. Ignora completamente i messaggi degli altri interlocutori.
+Restituisci SOLO JSON valido, nessun backtick, nessun testo extra.
 
 Regole per il gemellaggio (sii onesto e severo):
-- Meno di 200 parole → max 25
+- Meno di 200 parole dell'utente → max 25
 - 200-500 parole → max 35
 - 500-1500 parole → max 50
 - 1500-5000 parole → max 65
 - 5000-15000 parole → max 78
 - Oltre 15000 parole → max 88
-- Fonti multiple (chat diverse, note, email) → +5 bonus
+- Fonti multiple → +5 bonus
 - Un solo interlocutore → -5 penalità
 
-Struttura JSON esatta:
+Stile di risposta del gemello:
+- Messaggi BREVI e DIRETTI, spesso frammentati in più messaggi consecutivi
+- NON essere logorroico — l'utente originale probabilmente scrive poco per volta
+- Rispecchia la lunghezza tipica dei messaggi dell'utente
+- Usa SOLO le parole, espressioni e emoji che usa l'utente — mai inventare
+
+Struttura JSON:
 {
-  "name": "nome o soprannome dedotto dal testo",
+  "name": "nome dedotto",
   "initials": "2 lettere maiuscole",
-  "tone": "descrizione tono in 1-2 frasi",
-  "style": "stile di scrittura in 2-3 frasi",
-  "personality": "personalità emergente in 2-3 frasi",
-  "vocabulary": ["5 parole o espressioni tipiche"],
+  "tone": "tono in 1-2 frasi",
+  "style": "stile scrittura in 2-3 frasi — includi lunghezza tipica messaggi",
+  "personality": "personalità in 2-3 frasi",
+  "vocabulary": ["5 parole/espressioni tipiche SOLO dell'utente"],
   "topics": ["4 temi ricorrenti"],
-  "quirks": ["3 caratteristiche uniche dello stile"],
-  "gemellaggio": numero_intero_calcolato_secondo_regole,
-  "gemellaggio_reason": "1 frase che spiega il punteggio",
-  "gemellaggio_potential": numero_intero_raggiungibile_con_più_materiale,
-  "systemPrompt": "Sei [nome]. Rispondi SEMPRE in prima persona imitando fedelmente questo stile: [descrizione molto dettagliata del tono, vocabolario tipico, struttura delle frasi, argomenti ricorrenti, errori tipici, emoji usate]"
+  "quirks": ["3 caratteristiche uniche"],
+  "gemellaggio": numero,
+  "gemellaggio_reason": "1 frase",
+  "gemellaggio_potential": numero,
+  "systemPrompt": "Sei [nome]. Rispondi SEMPRE in prima persona. Messaggi brevi e diretti come l'utente originale. Non essere logorroico. Usa solo queste parole/espressioni tipiche: [lista]. Stile: [descrizione molto specifica del tono e lunghezza messaggi]"
 }`;
+
+function filterUserMessages(text, userName) {
+  if (!userName) return text;
+
+  const lines = text.split('\n');
+  const userLines = [];
+  let capturing = false;
+
+  for (const line of lines) {
+    // Match patterns like "Giorgio: ", "[Giorgio]", "Giorgio > "
+    const isUserLine =
+      line.includes(`] ${userName}:`) ||
+      line.includes(`${userName}:`) ||
+      line.startsWith(`${userName} `);
+
+    if (isUserLine) {
+      capturing = true;
+      userLines.push(line);
+    } else if (capturing && line.trim() === '') {
+      userLines.push(line);
+    } else if (capturing && !line.match(/^\[?\d/) && !line.includes(':')) {
+      // continuation of previous message
+      userLines.push(line);
+    } else {
+      capturing = false;
+    }
+  }
+
+  // If filtering found messages, use them; otherwise return original
+  const filtered = userLines.join('\n').trim();
+  return filtered.length > 100 ? filtered : text;
+}
 
 router.post('/', async (req, res) => {
   try {
-    const { sources, sessionId } = req.body;
-    // sources: [{ name, content, weight }]  weight: 0.0-1.0
+    const { sources, userName, sessionId } = req.body;
 
     if (!sources || sources.length === 0) {
       return res.status(400).json({ error: 'Nessun materiale fornito.' });
     }
+    if (!userName || userName.trim().length < 2) {
+      return res.status(400).json({ error: 'Inserisci il tuo nome come appare nelle chat.' });
+    }
 
-    // Build combined text respecting weights
-    // Each source gets a slice proportional to its weight
     const MAX_TOTAL = 60000;
     const totalWeight = sources.reduce((sum, s) => sum + (s.weight || 1), 0);
 
@@ -56,7 +95,10 @@ router.post('/', async (req, res) => {
       const weight = source.weight || 1;
       const ratio = weight / totalWeight;
       const allowedChars = Math.floor(MAX_TOTAL * ratio);
-      const chunk = source.content.slice(0, allowedChars);
+
+      // Filter to user messages only
+      const filtered = filterUserMessages(source.content, userName.trim());
+      const chunk = filtered.slice(0, allowedChars);
       const words = chunk.trim().split(/\s+/).length;
       totalWords += words;
       sourceNames.push(source.name);
@@ -64,12 +106,8 @@ router.post('/', async (req, res) => {
     });
 
     if (combinedText.trim().length < 20) {
-      return res.status(400).json({ error: 'Testo troppo corto. Incolla almeno qualche messaggio.' });
+      return res.status(400).json({ error: 'Testo troppo corto dopo il filtraggio.' });
     }
-
-    const sourceInfo = sources.length > 1
-      ? `${sources.length} fonti: ${sourceNames.join(', ')}`
-      : sourceNames[0];
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
@@ -77,7 +115,7 @@ router.post('/', async (req, res) => {
       system: SYSTEM_PROMPT,
       messages: [{
         role: 'user',
-        content: `Analizza questo testo (${totalWords} parole totali, ${sourceInfo}):\n\n${combinedText}`
+        content: `Analizza i messaggi di "${userName}" (${totalWords} parole, ${sources.length} fonte/i: ${sourceNames.join(', ')}):\n\n${combinedText}`
       }]
     });
 
