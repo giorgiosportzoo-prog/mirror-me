@@ -83,7 +83,7 @@ export default function Chat() {
         body: JSON.stringify({ profileId: id, message: text, history })
       });
       const data = await res.json();
-      setMessages(m => [...m, { role: 'assistant', content: data.reply, turns: Math.floor(data.totalMessages / 2) }]);
+      setMessages(m => [...m, { role: 'assistant', content: data.reply, turns: Math.floor((data.totalMessages || 2) / 2) }]);
     } catch {
       setMessages(m => [...m, { role: 'assistant', content: 'Errore. Riprova.' }]);
     } finally {
