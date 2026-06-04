@@ -36,25 +36,54 @@ Struttura JSON esatta:
 
 router.post('/', async (req, res) => {
   try {
-    const { text, sessionId } = req.body;
-    if (!text || text.trim().length < 20) {
+    const { sources, sessionId } = req.body;
+    // sources: [{ name, content, weight }]  weight: 0.0-1.0
+
+    if (!sources || sources.length === 0) {
+      return res.status(400).json({ error: 'Nessun materiale fornito.' });
+    }
+
+    // Build combined text respecting weights
+    // Each source gets a slice proportional to its weight
+    const MAX_TOTAL = 60000;
+    const totalWeight = sources.reduce((sum, s) => sum + (s.weight || 1), 0);
+
+    let combinedText = '';
+    let totalWords = 0;
+    const sourceNames = [];
+
+    sources.forEach(source => {
+      const weight = source.weight || 1;
+      const ratio = weight / totalWeight;
+      const allowedChars = Math.floor(MAX_TOTAL * ratio);
+      const chunk = source.content.slice(0, allowedChars);
+      const words = chunk.trim().split(/\s+/).length;
+      totalWords += words;
+      sourceNames.push(source.name);
+      combinedText += `\n\n--- FONTE: ${source.name} (importanza: ${Math.round(weight * 100)}%) ---\n${chunk}`;
+    });
+
+    if (combinedText.trim().length < 20) {
       return res.status(400).json({ error: 'Testo troppo corto. Incolla almeno qualche messaggio.' });
     }
 
-    const wordCount = text.trim().split(/\s+/).length;
-    const truncated = text.slice(0, 12000);
+    const sourceInfo = sources.length > 1
+      ? `${sources.length} fonti: ${sourceNames.join(', ')}`
+      : sourceNames[0];
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 1500,
       system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: `Analizza questo testo (${wordCount} parole):\n\n${truncated}` }]
+      messages: [{
+        role: 'user',
+        content: `Analizza questo testo (${totalWords} parole totali, ${sourceInfo}):\n\n${combinedText}`
+      }]
     });
 
     const raw = message.content[0].text.replace(/```json|```/g, '').trim();
     const profile = JSON.parse(raw);
 
-    // Save to Supabase
     const { data, error } = await supabase
       .from('profiles')
       .insert({
@@ -65,7 +94,7 @@ router.post('/', async (req, res) => {
         gemellaggio_potential: profile.gemellaggio_potential,
         profile_json: profile,
         system_prompt: profile.systemPrompt,
-        word_count: wordCount,
+        word_count: totalWords,
         last_learned_at: new Date().toISOString()
       })
       .select()
