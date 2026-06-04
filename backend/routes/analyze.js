@@ -6,7 +6,9 @@ const router = express.Router();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const SYSTEM_PROMPT = `Sei un esperto di linguistica e psicologia comportamentale.
-Analizza SOLO i messaggi scritti dall'utente specificato. Ignora completamente i messaggi degli altri interlocutori.
+Ti verrà fornito un testo con conversazioni e il nome dell'utente da analizzare.
+Analizza ESCLUSIVAMENTE i messaggi scritti da quell'utente. Ignora tutti gli altri.
+L'utente potrebbe apparire con varianti del nome (es. "Giorgio" = "Giorgio Fadda" = "G.Fadda").
 Restituisci SOLO JSON valido, nessun backtick, nessun testo extra.
 
 Regole per il gemellaggio (sii onesto e severo):
@@ -19,58 +21,44 @@ Regole per il gemellaggio (sii onesto e severo):
 - Fonti multiple → +5 bonus
 - Un solo interlocutore → -5 penalità
 
-Stile di risposta del gemello:
-- Messaggi BREVI e DIRETTI, spesso frammentati in più messaggi consecutivi
-- NON essere logorroico — l'utente originale probabilmente scrive poco per volta
-- Rispecchia la lunghezza tipica dei messaggi dell'utente
-- Usa SOLO le parole, espressioni e emoji che usa l'utente — mai inventare
+Regole per il systemPrompt del gemello:
+- Messaggi BREVI e DIRETTI, frammentati come l'originale
+- NON essere logorroico
+- Usa SOLO parole/espressioni/emoji che usa l'utente
+- Rispecchia la lunghezza tipica dei messaggi
 
 Struttura JSON:
 {
   "name": "nome dedotto",
   "initials": "2 lettere maiuscole",
   "tone": "tono in 1-2 frasi",
-  "style": "stile scrittura in 2-3 frasi — includi lunghezza tipica messaggi",
+  "style": "stile in 2-3 frasi con lunghezza tipica messaggi",
   "personality": "personalità in 2-3 frasi",
-  "vocabulary": ["5 parole/espressioni tipiche SOLO dell'utente"],
+  "vocabulary": ["5 espressioni tipiche SOLO dell'utente"],
   "topics": ["4 temi ricorrenti"],
   "quirks": ["3 caratteristiche uniche"],
   "gemellaggio": numero,
   "gemellaggio_reason": "1 frase",
   "gemellaggio_potential": numero,
-  "systemPrompt": "Sei [nome]. Rispondi SEMPRE in prima persona. Messaggi brevi e diretti come l'utente originale. Non essere logorroico. Usa solo queste parole/espressioni tipiche: [lista]. Stile: [descrizione molto specifica del tono e lunghezza messaggi]"
+  "systemPrompt": "Sei [nome]. Rispondi SEMPRE in prima persona con messaggi brevi e diretti. Non essere logorroico. Usa solo queste espressioni tipiche: [lista]. [descrizione specifica dello stile]"
 }`;
 
-function filterUserMessages(text, userName) {
-  if (!userName) return text;
-
-  const lines = text.split('\n');
-  const userLines = [];
-  let capturing = false;
-
-  for (const line of lines) {
-    // Match patterns like "Giorgio: ", "[Giorgio]", "Giorgio > "
-    const isUserLine =
-      line.includes(`] ${userName}:`) ||
-      line.includes(`${userName}:`) ||
-      line.startsWith(`${userName} `);
-
-    if (isUserLine) {
-      capturing = true;
-      userLines.push(line);
-    } else if (capturing && line.trim() === '') {
-      userLines.push(line);
-    } else if (capturing && !line.match(/^\[?\d/) && !line.includes(':')) {
-      // continuation of previous message
-      userLines.push(line);
-    } else {
-      capturing = false;
+function parseTelegramJSON(content) {
+  try {
+    const data = JSON.parse(content);
+    if (!data.messages) return content;
+    const lines = [];
+    for (const msg of data.messages) {
+      if (msg.type !== 'message') continue;
+      const from = msg.from || msg.from_id || 'Unknown';
+      let text = '';
+      if (typeof msg.text === 'string') text = msg.text;
+      else if (Array.isArray(msg.text)) text = msg.text.map(t => typeof t === 'string' ? t : (t.text || '')).join('');
+      if (!text.trim()) continue;
+      lines.push(`${from}: ${text}`);
     }
-  }
-
-  // If filtering found messages, use them; otherwise return original
-  const filtered = userLines.join('\n').trim();
-  return filtered.length > 100 ? filtered : text;
+    return lines.join('\n');
+  } catch { return content; }
 }
 
 router.post('/', async (req, res) => {
@@ -84,7 +72,7 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Inserisci il tuo nome come appare nelle chat.' });
     }
 
-    const MAX_TOTAL = 60000;
+    const MAX_TOTAL = 80000;
     const totalWeight = sources.reduce((sum, s) => sum + (s.weight || 1), 0);
 
     let combinedText = '';
@@ -96,17 +84,20 @@ router.post('/', async (req, res) => {
       const ratio = weight / totalWeight;
       const allowedChars = Math.floor(MAX_TOTAL * ratio);
 
-      // Filter to user messages only
-      const filtered = filterUserMessages(source.content, userName.trim());
-      const chunk = filtered.slice(0, allowedChars);
-      const words = chunk.trim().split(/\s+/).length;
-      totalWords += words;
+      // Parse Telegram JSON if needed
+      let content = source.content;
+      if (source.name && source.name.endsWith('.json')) {
+        content = parseTelegramJSON(content);
+      }
+
+      const chunk = content.slice(0, allowedChars);
+      totalWords += chunk.trim().split(/\s+/).length;
       sourceNames.push(source.name);
-      combinedText += `\n\n--- FONTE: ${source.name} (importanza: ${Math.round(weight * 100)}%) ---\n${chunk}`;
+      combinedText += `\n\n--- FONTE: ${source.name} ---\n${chunk}`;
     });
 
     if (combinedText.trim().length < 20) {
-      return res.status(400).json({ error: 'Testo troppo corto dopo il filtraggio.' });
+      return res.status(400).json({ error: 'Testo troppo corto.' });
     }
 
     const message = await anthropic.messages.create({
@@ -115,7 +106,7 @@ router.post('/', async (req, res) => {
       system: SYSTEM_PROMPT,
       messages: [{
         role: 'user',
-        content: `Analizza i messaggi di "${userName}" (${totalWords} parole, ${sources.length} fonte/i: ${sourceNames.join(', ')}):\n\n${combinedText}`
+        content: `Analizza i messaggi di "${userName}" (cerca tutte le varianti del nome). Fonti: ${sourceNames.join(', ')}.\n\n${combinedText}`
       }]
     });
 
