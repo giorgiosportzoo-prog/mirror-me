@@ -5,20 +5,21 @@ const supabase = require('../supabase');
 const router = express.Router();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const WINDOW_SIZE = 20; // max messages in active window
-const LEARN_EVERY = 6;  // update style learnings every N messages
+const WINDOW_SIZE = 20;
+const LEARN_EVERY = 6;
 
-// Extract important facts from a message exchange
-async function extractFacts(userMsg, assistantMsg, existingFacts) {
+// Extract facts ONLY from user message, never from gemello response
+async function extractFacts(userMsg, existingFacts) {
   const res = await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
-    max_tokens: 300,
-    system: `Sei un estrattore di fatti importanti. Analizza il messaggio dell'utente e decidi se contiene informazioni biografiche o emotive significative da ricordare permanentemente (morti, nascite, relazioni, lavoro, salute, decisioni importanti, eventi forti).
-Restituisci SOLO JSON: {"facts": ["fatto1", "fatto2"]} oppure {"facts": []} se non c'è nulla di importante.
-Ignora cose banali o temporanee. Sii conciso — max 15 parole per fatto.`,
+    max_tokens: 200,
+    system: `Estrai fatti importanti e permanenti dal messaggio dell'utente — eventi biografici, emozioni forti, decisioni rilevanti, relazioni, salute, lavoro. 
+Restituisci SOLO JSON: {"facts": ["fatto conciso"]} oppure {"facts": []}.
+Max 15 parole per fatto. Ignora cose banali o temporanee.
+NON includere opinioni o riflessioni generiche — solo fatti concreti sulla vita dell'utente.`,
     messages: [{
       role: 'user',
-      content: `Fatti già noti: ${existingFacts.join('; ') || 'nessuno'}\n\nMessaggio utente: "${userMsg}"\nRisposta gemello: "${assistantMsg}"\n\nNuovi fatti importanti da aggiungere?`
+      content: `Fatti già noti: ${existingFacts.join('; ') || 'nessuno'}\n\nMessaggio utente: "${userMsg}"\n\nNuovi fatti da aggiungere?`
     }]
   });
   try {
@@ -27,105 +28,90 @@ Ignora cose banali o temporanee. Sii conciso — max 15 parole per fatto.`,
   } catch { return []; }
 }
 
-// Update style learnings from recent conversation
+// Update style learnings from USER messages only
 async function updateStyleLearnings(recentMessages, currentLearnings, profileName) {
-  const conversation = recentMessages.map(m => `${m.role === 'user' ? 'Interlocutore' : profileName}: ${m.content}`).join('\n');
+  // Filter only user messages
+  const userMessages = recentMessages
+    .filter(m => m.role === 'user')
+    .map(m => m.content)
+    .join('\n');
+
+  if (!userMessages.trim()) return { learnings: currentLearnings, delta: 0 };
+
   const res = await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
     max_tokens: 400,
-    system: `Sei un analista linguistico. Osserva la conversazione e aggiorna i learnings sullo stile comunicativo di ${profileName}.
-Restituisci SOLO JSON: {"learnings": ["learning1", "learning2", ...], "gemellaggio_delta": numero_tra_-2_e_3}
-I learnings devono essere specifici: "Non usa mai X", "Usa spesso Y", "Risponde con una parola quando Z", ecc.
-gemellaggio_delta è quanto il gemellaggio dovrebbe aumentare o diminuire in base a quanto bene il gemello sta imitando.`,
+    system: `Sei un analista linguistico. Analizza SOLO i messaggi dell'utente e aggiorna i learnings sul suo stile comunicativo reale.
+Restituisci SOLO JSON: {"learnings": ["learning specifico"], "gemellaggio_delta": numero_tra_-1_e_2}
+Learnings devono essere specifici e basati su pattern reali osservati: "Non usa mai X", "Usa spesso Y", "Tende a Z quando parla di W".
+gemellaggio_delta: quanto il gemellaggio dovrebbe salire basandosi sulla qualità del materiale.`,
     messages: [{
       role: 'user',
-      content: `Learnings attuali: ${currentLearnings.join('; ') || 'nessuno'}\n\nConversazione recente:\n${conversation}\n\nAggiorna i learnings.`
+      content: `Learnings attuali: ${currentLearnings.join('; ') || 'nessuno'}\n\nMessaggi utente da analizzare:\n${userMessages}\n\nAggiorna i learnings.`
     }]
   });
   try {
     const parsed = JSON.parse(res.content[0].text.replace(/```json|```/g, '').trim());
-    return {
-      learnings: parsed.learnings || currentLearnings,
-      delta: parsed.gemellaggio_delta || 0
-    };
+    return { learnings: parsed.learnings || currentLearnings, delta: parsed.gemellaggio_delta || 0 };
   } catch { return { learnings: currentLearnings, delta: 0 }; }
 }
 
-// Compress old messages into a summary
 async function compressMessages(messages, profileName) {
-  const conversation = messages.map(m => `${m.role === 'user' ? 'Interlocutore' : profileName}: ${m.content}`).join('\n');
+  const conversation = messages.map(m => `${m.role === 'user' ? 'Utente' : profileName}: ${m.content}`).join('\n');
   const res = await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
-    max_tokens: 200,
-    system: 'Riassumi questa conversazione in 3-5 frasi concise, mantenendo i punti chiave discussi.',
+    max_tokens: 150,
+    system: 'Riassumi questa conversazione in 2-3 frasi, mantenendo solo i punti chiave.',
     messages: [{ role: 'user', content: conversation }]
   });
   return res.content[0].text;
 }
 
-// Main chat endpoint
 router.post('/', async (req, res) => {
   try {
     const { profileId, message, history } = req.body;
     if (!profileId || !message) return res.status(400).json({ error: 'profileId e message richiesti' });
 
     const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', profileId)
-      .single();
+      .from('profiles').select('*').eq('id', profileId).single();
     if (profileError || !profile) return res.status(404).json({ error: 'Profilo non trovato' });
 
-    // Load persistent memory from DB
     const { data: memoryData } = await supabase
-      .from('chat_memory')
-      .select('*')
-      .eq('profile_id', profileId)
-      .single();
+      .from('chat_memory').select('*').eq('profile_id', profileId).single();
 
     const permanentFacts = memoryData?.permanent_facts || [];
     const styleLearnings = memoryData?.style_learnings || [];
     const conversationSummary = memoryData?.conversation_summary || '';
     const totalMessages = memoryData?.total_messages || 0;
 
-    // Build system prompt with all memory layers
+    // Build system prompt
     let systemPrompt = profile.system_prompt;
 
-    // Inject "smarter/wiser" instruction
-    systemPrompt += `\n\nSei una versione leggermente migliorata di ${profile.name} — stesso stile, stesso linguaggio, ma un pelo più saggio e riflessivo. Non cambiare il modo di scrivere, solo il livello di insight.`;
-
     if (permanentFacts.length > 0) {
-      systemPrompt += `\n\nFATTI PERMANENTI (non dimenticare mai):\n${permanentFacts.map(f => `- ${f}`).join('\n')}`;
+      systemPrompt += `\n\nCOSE CHE SAI DI LUI (ha condiviso con te):\n${permanentFacts.map(f => `- ${f}`).join('\n')}`;
     }
 
     if (styleLearnings.length > 0) {
-      systemPrompt += `\n\nLEARNINGS SULLO STILE (aggiornati dalla conversazione):\n${styleLearnings.map(l => `- ${l}`).join('\n')}`;
+      systemPrompt += `\n\nHAI IMPARATO SUL SUO STILE:\n${styleLearnings.map(l => `- ${l}`).join('\n')}`;
     }
 
-    // Build message history with sliding window
+    // Build messages with sliding window
     const messages = [];
 
-    // Add summary of older conversation if exists
     if (conversationSummary) {
-      messages.push({
-        role: 'user',
-        content: `[Riassunto conversazione precedente: ${conversationSummary}]`
-      });
-      messages.push({
-        role: 'assistant',
-        content: 'Ho letto il riassunto.'
-      });
+      messages.push({ role: 'user', content: `[Contesto conversazione precedente: ${conversationSummary}]` });
+      messages.push({ role: 'assistant', content: 'Ok, ho il contesto.' });
     }
 
-    // Add recent window
-    const recentHistory = (history || []).slice(-WINDOW_SIZE);
+    const recentHistory = (history || [])
+      .filter(m => m.content && m.content.trim().length > 0)
+      .slice(-WINDOW_SIZE);
     recentHistory.forEach(m => messages.push({ role: m.role, content: m.content }));
     messages.push({ role: 'user', content: message });
 
-    // Get response
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
-      max_tokens: 500,
+      max_tokens: 400,
       system: systemPrompt,
       messages
     });
@@ -133,32 +119,33 @@ router.post('/', async (req, res) => {
     const reply = response.content[0].text;
     const newTotalMessages = totalMessages + 2;
 
-    // Save messages to chat_history
     await supabase.from('chat_history').insert([
       { profile_id: profileId, role: 'user', content: message },
       { profile_id: profileId, role: 'assistant', content: reply }
     ]);
 
-    // Extract important facts (async, don't block response)
     let newFacts = [];
     let newLearnings = styleLearnings;
     let gemellaggioDelta = 0;
     let newSummary = conversationSummary;
 
     try {
-      // Check for important facts
-      newFacts = await extractFacts(message, reply, permanentFacts);
+      // Extract facts ONLY from user message
+      newFacts = await extractFacts(message, permanentFacts);
       const updatedFacts = [...permanentFacts, ...newFacts.filter(f => !permanentFacts.includes(f))];
 
-      // Update style learnings every LEARN_EVERY messages
+      // Update style learnings from user messages only
       if (newTotalMessages % LEARN_EVERY === 0) {
-        const allRecent = [...(history || []).slice(-LEARN_EVERY), { role: 'user', content: message }, { role: 'assistant', content: reply }];
+        const allRecent = [
+          ...(history || []).slice(-LEARN_EVERY),
+          { role: 'user', content: message }
+        ];
         const result = await updateStyleLearnings(allRecent, styleLearnings, profile.name);
         newLearnings = result.learnings;
         gemellaggioDelta = result.delta;
       }
 
-      // Compress old messages if window is full
+      // Compress old messages
       if ((history || []).length > WINDOW_SIZE) {
         const toCompress = (history || []).slice(0, -WINDOW_SIZE);
         if (toCompress.length >= 4) {
@@ -166,24 +153,22 @@ router.post('/', async (req, res) => {
         }
       }
 
-      // Update memory in DB
       await supabase.from('chat_memory').upsert({
         profile_id: profileId,
-        permanent_facts: updatedFacts,
+        permanent_facts: [...permanentFacts, ...newFacts.filter(f => !permanentFacts.includes(f))],
         style_learnings: newLearnings,
         conversation_summary: newSummary,
         total_messages: newTotalMessages,
         updated_at: new Date().toISOString()
       }, { onConflict: 'profile_id' });
 
-      // Update gemellaggio if changed
       if (gemellaggioDelta !== 0) {
         const newGem = Math.min(88, Math.max(0, (profile.gemellaggio || 0) + gemellaggioDelta));
         await supabase.from('profiles').update({ gemellaggio: newGem }).eq('id', profileId);
       }
 
     } catch (memErr) {
-      console.error('Memory update error (non-blocking):', memErr.message);
+      console.error('Memory update error:', memErr.message);
     }
 
     res.json({
@@ -191,7 +176,7 @@ router.post('/', async (req, res) => {
       totalMessages: newTotalMessages,
       newFacts,
       learnedSomething: newTotalMessages % LEARN_EVERY === 0,
-      gemellaggio: profile.gemellaggio + gemellaggioDelta
+      gemellaggio: (profile.gemellaggio || 0) + gemellaggioDelta
     });
 
   } catch (err) {
@@ -200,7 +185,6 @@ router.post('/', async (req, res) => {
   }
 });
 
-// Manual learn endpoint
 router.post('/learn', async (req, res) => {
   try {
     const { profileId } = req.body;
@@ -210,8 +194,7 @@ router.post('/learn', async (req, res) => {
     const { data: memory } = await supabase.from('chat_memory').select('*').eq('profile_id', profileId).single();
 
     const { data: recentChats } = await supabase
-      .from('chat_history')
-      .select('role, content, created_at')
+      .from('chat_history').select('role, content, created_at')
       .eq('profile_id', profileId)
       .order('created_at', { ascending: false })
       .limit(30);
@@ -237,7 +220,10 @@ router.post('/learn', async (req, res) => {
       updated_at: new Date().toISOString()
     }, { onConflict: 'profile_id' });
 
-    await supabase.from('profiles').update({ gemellaggio: newGem, last_learned_at: new Date().toISOString() }).eq('id', profileId);
+    await supabase.from('profiles').update({
+      gemellaggio: newGem,
+      last_learned_at: new Date().toISOString()
+    }).eq('id', profileId);
 
     res.json({ updated: true, learnings: result.learnings, gemellaggio: newGem });
 
