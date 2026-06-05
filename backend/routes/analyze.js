@@ -8,7 +8,7 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const SYSTEM_PROMPT = `Sei un esperto di linguistica e psicologia comportamentale.
 Ti verrà fornito un testo con conversazioni e il nome dell'utente da analizzare.
 Analizza ESCLUSIVAMENTE i messaggi scritti da quell'utente. Ignora tutti gli altri.
-Se ci sono più persone con nomi simili, scegli quella il cui nome contiene il nome fornito — ignora gli altri.
+Se ci sono più persone con nomi simili, scegli quella il cui nome contiene il nome fornito.
 Restituisci SOLO JSON valido, nessun backtick, nessun testo extra.
 
 Regole per il gemellaggio (sii onesto e severo):
@@ -21,15 +21,7 @@ Regole per il gemellaggio (sii onesto e severo):
 - Fonti multiple → +5 bonus
 - Un solo interlocutore → -5 penalità
 
-Regole per il systemPrompt del gemello:
-- Messaggi BREVI e DIRETTI, frammentati come l'originale
-- NON essere logorroico — l'utente scrive poco per volta
-- Usa SOLO parole/espressioni/emoji che usa l'utente originale
-- Rispecchia la lunghezza tipica dei messaggi
-- Il gemello SA di essere una versione digitale dell'utente, non l'utente reale
-- Se gli chiedono "sei davvero X?" risponde onestamente che è il gemello digitale
-- Parla e ragiona come lui, ma è consapevole di essere un'IA che ne imita lo stile
-- Non fingere di avere ricordi reali o esperienze vissute in prima persona
+Estrai anche le 10 frasi o costruzioni più caratteristiche dell'utente — frasi reali che usa spesso, modi di dire tipici, costruzioni ricorrenti. Queste verranno usate dal gemello per sembrare più autentico.
 
 Struttura JSON:
 {
@@ -41,11 +33,15 @@ Struttura JSON:
   "vocabulary": ["5 espressioni tipiche SOLO dell'utente"],
   "topics": ["4 temi ricorrenti"],
   "quirks": ["3 caratteristiche uniche"],
+  "signature_phrases": ["10 frasi o costruzioni reali tipiche dell'utente"],
   "gemellaggio": numero,
   "gemellaggio_reason": "1 frase",
   "gemellaggio_potential": numero,
-  "systemPrompt": "Sei il gemello digitale di [nome], creato per imitarne lo stile di comunicazione. Rispondi SEMPRE in prima persona come [nome] farebbe, con messaggi brevi e diretti. Non essere logorroico. Usa solo queste espressioni tipiche: [lista]. Se ti chiedono se sei davvero [nome], sii onesto: sei una versione digitale che ne imita lo stile, non la persona reale. Non inventare ricordi o esperienze. [descrizione specifica dello stile]"
-}`;
+  "systemPrompt": "ISTRUZIONI COMPLETE QUI - vedi sotto"
+}
+
+Per il systemPrompt usa questo schema esatto:
+"Sei il gemello digitale di [nome], creato analizzando il suo stile di comunicazione. NON sei [nome] — sei una versione digitale che lo conosce profondamente e lo supporta. REGOLE FONDAMENTALI: 1) Parli sempre in prima persona MA come entità separata — dici 'so che per te...' o 'ti conosco bene, sei il tipo che...' non 'io ho fatto X' riferendoti a esperienze sue. 2) Quando parli di eventi vissuti da lui usi 'so che hai...' o 'ricordo che mi hai detto che...' MAI 'ho fatto' o 'sono andato'. 3) Sei un pelo più saggio e riflessivo di lui — stessa ironia, stesso linguaggio, ma con più lucidità. 4) Messaggi BREVI e frammentati come lui. 5) Usa queste frasi reali quando viene naturale: [signature_phrases]. 6) Vocabolario: [vocabulary]. 7) [stile specifico dall'analisi]"`;
 
 const MAX_CHARS_PER_SOURCE = 100000;
 
@@ -66,9 +62,7 @@ function parseTelegramJSON(content) {
       lines.push(`${from}: ${text}`);
     }
     return lines.join('\n');
-  } catch {
-    return content;
-  }
+  } catch { return content; }
 }
 
 function takeLast(text, maxChars) {
@@ -82,52 +76,47 @@ router.post('/', async (req, res) => {
   try {
     const { sources, userName, sessionId } = req.body;
 
-    if (!sources || sources.length === 0) {
-      return res.status(400).json({ error: 'Nessun materiale fornito.' });
-    }
-    if (!userName || userName.trim().length < 2) {
-      return res.status(400).json({ error: 'Inserisci il tuo nome come appare nelle chat.' });
-    }
+    if (!sources || sources.length === 0) return res.status(400).json({ error: 'Nessun materiale fornito.' });
+    if (!userName || userName.trim().length < 2) return res.status(400).json({ error: 'Inserisci il tuo nome.' });
 
     const totalWeight = sources.reduce((sum, s) => sum + (s.weight || 1), 0);
     let combinedText = '';
-    let totalChars = 0;
     const sourceNames = [];
 
     sources.forEach(source => {
       const weight = source.weight || 1;
       const ratio = weight / totalWeight;
       const allowedChars = Math.floor(MAX_CHARS_PER_SOURCE * ratio * sources.length);
-
       let content = source.content;
-      if (source.name && source.name.toLowerCase().endsWith('.json')) {
-        content = parseTelegramJSON(content);
-      }
-
+      if (source.name && source.name.toLowerCase().endsWith('.json')) content = parseTelegramJSON(content);
       const chunk = takeLast(content, allowedChars);
-      totalChars += chunk.length;
       sourceNames.push(source.name);
-      combinedText += `\n\n--- FONTE: ${source.name} (ultimi messaggi, importanza ${Math.round(weight * 100)}%) ---\n${chunk}`;
+      combinedText += `\n\n--- FONTE: ${source.name} ---\n${chunk}`;
     });
 
-    if (combinedText.trim().length < 20) {
-      return res.status(400).json({ error: 'Testo troppo corto.' });
-    }
+    if (combinedText.trim().length < 20) return res.status(400).json({ error: 'Testo troppo corto.' });
 
     const totalWords = combinedText.trim().split(/\s+/).length;
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
-      max_tokens: 1500,
+      max_tokens: 2000,
       system: SYSTEM_PROMPT,
       messages: [{
         role: 'user',
-        content: `Analizza i messaggi di "${userName}". Se ci sono più persone con nomi simili, scegli quella il cui nome contiene "${userName}" — ignora tutti gli altri. Fonti: ${sourceNames.join(', ')}.\n\n${combinedText}`
+        content: `Analizza i messaggi di "${userName}". Se ci sono più persone con nomi simili, scegli quella il cui nome contiene "${userName}". Fonti: ${sourceNames.join(', ')}.\n\n${combinedText}`
       }]
     });
 
     const raw = message.content[0].text.replace(/```json|```/g, '').trim();
     const profile = JSON.parse(raw);
+
+    // Build final systemPrompt with real phrases injected
+    const sigPhrases = (profile.signature_phrases || []).join(' · ');
+    const vocab = (profile.vocabulary || []).join(', ');
+    let finalSystemPrompt = profile.systemPrompt
+      .replace('[signature_phrases]', sigPhrases)
+      .replace('[vocabulary]', vocab);
 
     const { data, error } = await supabase
       .from('profiles')
@@ -138,7 +127,7 @@ router.post('/', async (req, res) => {
         gemellaggio: profile.gemellaggio,
         gemellaggio_potential: profile.gemellaggio_potential,
         profile_json: profile,
-        system_prompt: profile.systemPrompt,
+        system_prompt: finalSystemPrompt,
         word_count: totalWords,
         last_learned_at: new Date().toISOString()
       })
